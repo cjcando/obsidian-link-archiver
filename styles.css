@@ -1,0 +1,46 @@
+/* Container for the tab buttons */
+.settings-tabs {
+  display: flex;
+  margin-bottom: 20px;
+}
+
+/* Shared styles for both tabs */
+.settings-tab {
+  padding: 10px 15px;
+  border: 1px solid var(--background-modifier-border);
+  cursor: pointer;
+  user-select: none;
+}
+
+/* Rounded edges for each tab */
+.settings-tab.general-tab {
+  border-radius: 5px 0 0 5px;
+}
+
+.settings-tab.exclusion-tab {
+  border-left: none;
+  border-radius: 0 5px 5px 0;
+}
+
+/* Highlight the active tab */
+.settings-tab.active {
+  font-weight: bold;
+}
+
+/* Hidden tab content */
+.settings-content {
+  display: none;
+}
+
+.settings-content.active {
+  display: block;
+}
+
+/* Targeted tab modal */
+.targeted-info {
+  padding: 10px;
+  background-color: var(--modal-background);
+  border-radius:  5px;
+  border: 1px solid var(--background-modifier-border);
+  margin-bottom: 15px;
+}

@@ -1,0 +1,19 @@
+{
+  "name": "obsidian-link-archiver",
+  "version": "1.0.0",
+  "main": "main.js",
+  "scripts": {
+    "dev": "esbuild main.ts --bundle --outfile=main.js --watch --platform=node --external:obsidian",
+    "build": "esbuild main.ts --bundle --minify --outfile=main.js --platform=node --external:obsidian --format=esm --tree-shaking=true"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.18",
+    "esbuild": "^0.17.19",
+    "typescript": "^5.8.3"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0",
+    "obsidian": "^1.8.7",
+    "tslib": "^2.8.1"
+  }
+}

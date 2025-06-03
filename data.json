@@ -1,0 +1,35 @@
+{
+  "showRibbonIcon": true,
+  "useNakedUrls": false,
+  "useNakedArchiveOnly": true,
+  "scrapePageTitles": false,
+  "autoPickLatestArchive": true,
+  "maxSnapshots": 5,
+  "dividerText": " | 🎈 ",
+  "archiveText": "(archive)",
+  "archiveSite": "archive.ph",
+  "preserveMarkdownLinks": true,
+  "confirmNoteArchiving": true,
+  "requireTimestamps": true,
+  "excludeFolders": [
+    "Archived",
+    "Testing"
+  ],
+  "excludeFilesWithTags": [
+    "#stop"
+  ],
+  "useInvertedExclusion": true,
+  "targetFolders": [
+    "Slipbox"
+  ],
+  "targetFilesWithTags": [
+    "#rock"
+  ],
+  "detailedReporting": true,
+  "respectObsidianExclusions": false,
+  "preserveUserTitles": true,
+  "respectOriginalFormat": false,
+  "customFormat": "{original} | {archived}",
+  "useNakedLinks": true,
+  "autoUseLatestSnapshot": true
+}

@@ -2,3 +2,4 @@ __mocks__/
 node_modules/
 .archive/
 *.log
+plugin-dist/

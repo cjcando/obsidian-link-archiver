@@ -28,6 +28,8 @@ interface LinkArchiverSettings {
   confirmNoteArchiving: boolean;
   requireTimestamps: boolean;
   maxSnapshots: number;
+  // Debug mode setting
+  debugMode: boolean;
   // Exclusion settings
   excludeFolders: string[];
   excludeFilesWithTags: string[];
@@ -52,6 +54,8 @@ const DEFAULT_SETTINGS: LinkArchiverSettings = {
   preserveMarkdownLinks: true,
   confirmNoteArchiving: true,
   requireTimestamps: true,
+  // Debug mode default
+  debugMode: false,
   // Default exclusion settings
   excludeFolders: [],
   excludeFilesWithTags: [],
@@ -369,7 +373,9 @@ export default class LinkArchiverPlugin extends Plugin {
 				}
 			}
 		} catch (error) {
-			console.error("Error archiving link:", error);
+			if (this.settings.debugMode) {
+				console.error("Error archiving link:", error);
+			}
 			new Notice("Error checking for archives. Please try again.");
 		}
 	}
@@ -408,12 +414,13 @@ export default class LinkArchiverPlugin extends Plugin {
 			const urlObj = new URL(url);
 			return urlObj.hostname.replace(/^www\./, '');
 		} catch (error) {
-			console.error("Error extracting title:", error);
+			if (this.settings.debugMode) {
+				console.error("Error extracting title:", error);
+			}
 			
 			// Implement retry logic with exponential backoff
 			if (retryCount < 2) { // Try up to 3 times total (initial + 2 retries)
 				const delay = Math.pow(2, retryCount) * 1000; // 1s, 2s delay
-				console.log(`Retrying title extraction in ${delay}ms...`);
 				
 				// Wait for the delay period
 				await new Promise(resolve => setTimeout(resolve, delay));
@@ -535,7 +542,9 @@ export default class LinkArchiverPlugin extends Plugin {
 	    editor.setLine(lineNumber, newLine);
 	  } else {
 	    // Fallback: if exact match fails, log and show error
-	    console.warn(`Could not find exact match for: ${linkInfo.fullMatch} in line: ${originalLine}`);
+	    if (this.settings.debugMode) {
+	  console.warn(`Could not find exact match for: ${linkInfo.fullMatch} in line: ${originalLine}`);
+	 }
 	    new Notice(`Could not match link in line for replacement: ${linkInfo.originalUrl}`);
 	  }
 }
@@ -610,7 +619,10 @@ export default class LinkArchiverPlugin extends Plugin {
     }
     
     // Skip ghostarchive URLs specifically
-    const ghostArchivePattern = /https?:\/\/ghostarchive\.org\/(archive|varchive)\/[a-zA-Z0-9]+/g;
+    const ghostArchivePattern = new RegExp(
+        "https?://ghostarchive\\.org/(archive|varchive)/[a-z0-9]+",
+        "gi"
+    );
     if (linkInfo.originalUrl.match(ghostArchivePattern)) {
       skippedLinks.isArchiveUrl++;
       if (this.settings.detailedReporting) {
@@ -666,7 +678,9 @@ export default class LinkArchiverPlugin extends Plugin {
         await new Promise(resolve => setTimeout(resolve, 1000)); // 1 second delay
       }
     } catch (error) {
-      console.error(`Error archiving link on line ${i + 1}:`, error);
+      if (this.settings.debugMode) {
+    console.error(`Error archiving link on line ${i + 1}:`, error);
+   }
       
       // Check if the error is related to rate limiting
       if (error.message && (
@@ -919,21 +933,15 @@ export default class LinkArchiverPlugin extends Plugin {
               const replacement = `${originalPart}${this.settings.dividerText}${archivedPart}`;
               
               // Debug logging
-              console.log(`  Processing line ${i + 1} in ${file.path}:`);
-              console.log(`  Original line: ${lines[i]}`);
-              console.log(`  Link info fullMatch: ${linkInfo.fullMatch}`);
-              console.log(`  Replacement: ${replacement}`);
               
                   if (lines[i].includes(linkInfo.fullMatch)) {
                     newLine = lines[i].replace(linkInfo.fullMatch, replacement);
-                    console.log(`  New line: ${newLine}`);
                     lines[i] = newLine; // MOVE THIS HERE
                     modified = true;
                     totalArchived++;
                     fileArchived++;
                 } else {
                   // Fallback: if exact match fails, log and skip this link
-                  console.warn(`Could not find exact match for: ${linkInfo.fullMatch} in line: ${lines[i]}`);
                   skippedLinks.errors++;
                   fileSkipped++;
                   if (this.settings.detailedReporting) {
@@ -965,7 +973,9 @@ export default class LinkArchiverPlugin extends Plugin {
               continue;
             }
           } catch (error) {
-            console.error(`Error archiving link in ${file.path}:`, error);
+            if (this.settings.debugMode) {
+    console.error(`Error archiving link in ${file.path}:`, error);
+   }
             
             // Check if the error is related to rate limiting
             if (error.message && error.message.includes("Rate limited")) {
@@ -1082,7 +1092,7 @@ export default class LinkArchiverPlugin extends Plugin {
           archivedUrl: snapshot.url,
           snapshots: [{ url: snapshot.url, timestamp: snapshot.timestamp || 'Unknown' }]
         };
-      } else {
+      } else if (this.settings.debugMode) {
         console.log(`No Wayback Machine snapshots found`);
       }
     } catch (err) {
@@ -1114,9 +1124,13 @@ export default class LinkArchiverPlugin extends Plugin {
     console.log("Processing with Ghostarchive");
     try {
       const archiver = new GhostArchiveArchiver(this);
-      console.log(`getExistingArchive: calling GhostArchiveArchiver for ${originalUrl}`);
+      if (this.settings.debugMode) {
+        console.log(`getExistingArchive: calling GhostArchiveArchiver for ${originalUrl}`);
+      }
       const snapshots = await archiver.getSnapshots(originalUrl);
-      console.log(`getExistingArchive: GhostArchiveArchiver returned ${snapshots.length} snapshots`);
+      if (this.settings.debugMode) {
+        console.log(`getExistingArchive: GhostArchiveArchiver returned ${snapshots.length} snapshots`);
+      }
       
       if (snapshots.length > 0) {
         // Sort by timestamp descending
@@ -1128,13 +1142,15 @@ export default class LinkArchiverPlugin extends Plugin {
           }
         });
         
-        console.log(`Found ${snapshots.length} Ghostarchive snapshots`);
+        if (this.settings.debugMode) {
+          console.log(`Found ${snapshots.length} Ghostarchive snapshots`);
+        }
         return {
           foundArchive: true,
           archivedUrl: snapshots[0].url,
           snapshots: snapshots
         };
-      } else {
+      } else if (this.settings.debugMode) {
         console.log(`No Ghostarchive snapshots found for URL: ${originalUrl}`);
       }
     } catch (err) {
@@ -1150,19 +1166,25 @@ export default class LinkArchiverPlugin extends Plugin {
     // Archive.today family sites - use HTML scraping
     console.log("Processing with archive.today family");
     try {
-      console.log(`Checking archive site for: ${originalUrl}`);
+      if (this.settings.debugMode) {
+        console.log(`Checking archive site for: ${originalUrl}`);
+      }
       const snapshots = await this.getArchiveTodaySnapshots(originalUrl, archiveBaseUrl);
-      
-      console.log(`getArchiveTodaySnapshots returned ${snapshots.length} snapshots`);
+
+      if (this.settings.debugMode) {
+        console.log(`getArchiveTodaySnapshots returned ${snapshots.length} snapshots`);
+      }
       
       if (snapshots.length > 0) {
-        console.log(`Found ${snapshots.length} snapshots for archive.today`);
+        if (this.settings.debugMode) {
+          console.log(`Found ${snapshots.length} snapshots for archive.today`);
+        }
         return {
           foundArchive: true,
           archivedUrl: snapshots[0].url, // Latest snapshot (already sorted)
           snapshots: snapshots
         };
-      } else {
+      } else if (this.settings.debugMode) {
         console.log(`No archive.today snapshots found for URL: ${originalUrl}`);
       }
     } catch (err) {
@@ -1522,7 +1544,9 @@ export default class LinkArchiverPlugin extends Plugin {
 							index === self.findIndex(s => s.url === snapshot.url)
 						);
 						
-						console.log(`Found ${uniqueSnapshots.length} valid snapshots for ${originalUrl}:`, uniqueSnapshots);
+						if (this.settings.debugMode) {
+							console.log(`Found ${uniqueSnapshots.length} valid snapshots for ${originalUrl}:`, uniqueSnapshots);
+						}
 						
               // After collecting all snapshots:
               if (uniqueSnapshots.length > 0) {
@@ -1656,7 +1680,9 @@ export default class LinkArchiverPlugin extends Plugin {
 	      }
 	    });
 	    
-	    console.log(`Processed ${rowCount} rows, found ${validSnapshotCount} valid snapshots`);
+	    if (this.settings.debugMode) {
+	  console.log(`Processed ${rowCount} rows, found ${validSnapshotCount} valid snapshots`);
+	 }
 	    return snapshots;
 	  } catch (error) {
 	    console.error("Error fetching Ghost Archive snapshots:", error);

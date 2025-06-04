@@ -1,7 +1,7 @@
 {
   "id": "obsidian-link-archiver",
   "name": "Right-click Link Archiver",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Insert archive links for external URLs with one click.",
   "author": "cjcando",
   "main": "main.js",

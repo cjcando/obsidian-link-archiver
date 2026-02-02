@@ -4,3 +4,5 @@ node_modules/
 *.log
 plugin-dist/
 *.map
+main.js
+CLAUDE.md

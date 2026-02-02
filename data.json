@@ -2,15 +2,16 @@
   "showRibbonIcon": true,
   "useNakedUrls": false,
   "useNakedArchiveOnly": true,
-  "scrapePageTitles": false,
+  "scrapePageTitles": true,
   "autoPickLatestArchive": true,
   "maxSnapshots": 5,
   "dividerText": " | 🎈 ",
   "archiveText": "(archive)",
-  "archiveSite": "archive.ph",
+  "archiveSite": "ghostarchive.org",
   "preserveMarkdownLinks": true,
   "confirmNoteArchiving": true,
   "requireTimestamps": true,
+  "debugMode": false,
   "excludeFolders": [
     "Archived",
     "Testing"
@@ -26,6 +27,8 @@
     "#rock"
   ],
   "detailedReporting": true,
+  "enableTitleCache": true,
+  "titleFetchTimeout": 10000,
   "respectObsidianExclusions": false,
   "preserveUserTitles": true,
   "respectOriginalFormat": false,

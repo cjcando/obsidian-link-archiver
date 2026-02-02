@@ -39,6 +39,9 @@ interface LinkArchiverSettings {
   targetFilesWithTags: string[];
   // Reporting settings
   detailedReporting: boolean;
+  // Title cache settings
+  enableTitleCache: boolean;
+  titleFetchTimeout: number;
 }
 
 const DEFAULT_SETTINGS: LinkArchiverSettings = {
@@ -50,7 +53,7 @@ const DEFAULT_SETTINGS: LinkArchiverSettings = {
   maxSnapshots: 5,
   dividerText: " | ",
   archiveText: "(archive)", // Default archive text
-  archiveSite: "archive.ph",
+  archiveSite: "web.archive.org",
   preserveMarkdownLinks: true,
   confirmNoteArchiving: true,
   requireTimestamps: true,
@@ -65,25 +68,159 @@ const DEFAULT_SETTINGS: LinkArchiverSettings = {
   targetFilesWithTags: [],
   // Default reporting settings
   detailedReporting: true,
+  // Default title cache settings
+  enableTitleCache: true,
+  titleFetchTimeout: 10000, // 10 seconds
 };
 
 const ARCHIVE_SITES = {
-	"archive.ph": "https://archive.ph",
-	"archive.li": "https://archive.li",
-	"archive.is": "https://archive.is",
-	"archive.vn": "https://archive.vn",
-  "archive.md": "https://archive.md",
-  "archive.today": "https://archive.today",
   "ghostarchive.org": "https://ghostarchive.org",
   "web.archive.org": "https://web.archive.org/web"
 };
 
+// Error classification for archive services
+enum ArchiveErrorType {
+	RATE_LIMITED = "rate_limited",
+	CAPTCHA_REQUIRED = "captcha_required",
+	IP_BLOCKED = "ip_blocked",
+	SERVICE_UNAVAILABLE = "service_unavailable",
+	NETWORK_ERROR = "network_error",
+	UNKNOWN = "unknown"
+}
+
+interface ArchiveError {
+	type: ArchiveErrorType;
+	message: string;
+	serviceName: string;
+}
+
+// Rate limiter to enforce delays between requests to archive services
+class RateLimiter {
+	private lastRequestTime: Map<string, number> = new Map();
+	private delays: Map<string, number> = new Map();
+
+	constructor() {
+		// Set default delays per service (in milliseconds)
+		this.delays.set("web.archive.org", 1000); // 1 second for Wayback Machine
+		this.delays.set("ghostarchive.org", 2000); // 2 seconds for GhostArchive
+		// Archive.today variants get 2 second delay
+		this.delays.set("archive.ph", 2000);
+		this.delays.set("archive.li", 2000);
+		this.delays.set("archive.is", 2000);
+		this.delays.set("archive.vn", 2000);
+		this.delays.set("archive.md", 2000);
+		this.delays.set("archive.today", 2000);
+	}
+
+	async waitIfNeeded(serviceName: string): Promise<void> {
+		const delay = this.delays.get(serviceName) || 1000;
+		const lastRequest = this.lastRequestTime.get(serviceName) || 0;
+		const now = Date.now();
+		const timeSinceLastRequest = now - lastRequest;
+
+		if (timeSinceLastRequest < delay) {
+			const waitTime = delay - timeSinceLastRequest;
+			await new Promise(resolve => setTimeout(resolve, waitTime));
+		}
+
+		this.lastRequestTime.set(serviceName, Date.now());
+	}
+}
+
+// Simple cache for archive lookups to avoid duplicate requests
+class ArchiveCache {
+	private cache: Map<string, { result: any, timestamp: number }> = new Map();
+	private ttl: number = 5 * 60 * 1000; // 5 minutes in milliseconds
+
+	get(url: string): any | null {
+		const entry = this.cache.get(url);
+		if (!entry) return null;
+
+		const now = Date.now();
+		if (now - entry.timestamp > this.ttl) {
+			// Expired
+			this.cache.delete(url);
+			return null;
+		}
+
+		return entry.result;
+	}
+
+	set(url: string, result: any): void {
+		this.cache.set(url, {
+			result,
+			timestamp: Date.now()
+		});
+	}
+
+	clear(): void {
+		this.cache.clear();
+	}
+}
+
+// LRU cache for page titles with 24-hour TTL
+class TitleCache {
+	private cache: Map<string, { title: string, timestamp: number }> = new Map();
+	private ttl: number = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
+	private maxSize: number = 500; // Maximum cache entries
+
+	get(url: string): string | null {
+		const entry = this.cache.get(url);
+		if (!entry) return null;
+
+		const now = Date.now();
+		if (now - entry.timestamp > this.ttl) {
+			// Expired
+			this.cache.delete(url);
+			return null;
+		}
+
+		// LRU: move to end by deleting and re-adding
+		this.cache.delete(url);
+		this.cache.set(url, entry);
+
+		return entry.title;
+	}
+
+	set(url: string, title: string): void {
+		// If at max size, remove oldest entry (first in map)
+		if (this.cache.size >= this.maxSize) {
+			const firstKey = this.cache.keys().next().value;
+			if (firstKey) {
+				this.cache.delete(firstKey);
+			}
+		}
+
+		this.cache.set(url, {
+			title,
+			timestamp: Date.now()
+		});
+	}
+
+	clear(): void {
+		this.cache.clear();
+	}
+}
+
 export default class LinkArchiverPlugin extends Plugin {
 	settings: LinkArchiverSettings;
   ribbonIconEl: HTMLElement | null = null;
+	private rateLimiter: RateLimiter;
+	private archiveCache: ArchiveCache;
+	private titleCache: TitleCache;
 
 	async loadSettings() {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+
+		// Migration: auto-switch from deprecated archive.today variants to Wayback Machine
+		const deprecatedSites = ['archive.ph', 'archive.li', 'archive.is', 'archive.vn', 'archive.md', 'archive.today'];
+		if (deprecatedSites.includes(this.settings.archiveSite)) {
+			const oldSite = this.settings.archiveSite;
+			console.log(`Migrating from deprecated archive service ${oldSite} to web.archive.org`);
+			this.settings.archiveSite = 'web.archive.org';
+			await this.saveSettings();
+			new Notice(`Archive service migrated from ${oldSite} to Wayback Machine due to CAPTCHA/blocking issues.`);
+		}
   }
 
 	async saveSettings() {
@@ -92,6 +229,9 @@ export default class LinkArchiverPlugin extends Plugin {
 
 	async onload() {
 		await this.loadSettings();
+		this.rateLimiter = new RateLimiter();
+		this.archiveCache = new ArchiveCache();
+		this.titleCache = new TitleCache();
 		this.addSettingTab(new LinkArchiverSettingTab(this.app, this));
 		this.updateRibbonIcon();
 		
@@ -126,7 +266,20 @@ export default class LinkArchiverPlugin extends Plugin {
 			name: "Archive links in targeted files only",
 			callback: () => this.archiveTargetedFiles(),
 		});
-		
+
+		// Add convert naked URLs commands
+		this.addCommand({
+			id: "convert-naked-urls-to-markdown",
+			name: "Convert naked URLs to markdown",
+			editorCallback: (editor: Editor) => this.convertNakedUrlsToMarkdown(editor),
+		});
+
+		this.addCommand({
+			id: "convert-all-naked-urls-in-note",
+			name: "Convert all naked URLs in current note",
+			editorCallback: (editor: Editor) => this.convertAllNakedUrlsInNote(editor),
+		});
+
 		// Register a single context menu item
 		this.registerEvent(
 			this.app.workspace.on("editor-menu", (menu, editor, view) => {
@@ -141,6 +294,11 @@ export default class LinkArchiverPlugin extends Plugin {
 				if (hasUrlInSelection || hasUrlInLine) {
 					// Check if the text already has an archive link
 					const textToCheck = hasUrlInSelection ? selection : line;
+
+					// Check if there are naked URLs (not in markdown format)
+					const nakedUrlPattern = /(?<!\]\()https?:\/\/[^\s)\]]+(?!\))/;
+					const hasNakedUrl = nakedUrlPattern.test(textToCheck);
+
 					if (this.lineContainsArchiveLink(textToCheck)) {
 						menu.addItem((item) =>
 							item
@@ -165,10 +323,68 @@ export default class LinkArchiverPlugin extends Plugin {
 								.setIcon("link")
 								.onClick(() => this.archiveLinkAtCursor(editor))
 						);
+
+						// Add convert to markdown option if naked URLs detected and scraping is enabled
+						if (hasNakedUrl && this.settings.scrapePageTitles) {
+							menu.addItem((item) =>
+								item
+									.setTitle("Convert to markdown link")
+									.setIcon("file-text")
+									.onClick(() => this.convertNakedUrlsToMarkdown(editor))
+							);
+						}
+						
+						// Add "Create link title" option for links without meaningful titles
+						if (this.settings.scrapePageTitles) {
+							const linkInfo = this.extractUrlFromLine(textToCheck);
+							if (linkInfo) {
+								// Check if the link has a meaningful title (not just the URL)
+								const hasMeaningfulTitle = linkInfo.displayText && 
+									linkInfo.displayText !== linkInfo.originalUrl &&
+									!linkInfo.displayText.toLowerCase().includes('http');
+								
+								if (!hasMeaningfulTitle) {
+									menu.addItem((item) =>
+										item
+											.setTitle("Create link title")
+											.setIcon("heading")
+											.onClick(() => this.createLinkTitle(editor, linkInfo))
+									);
+								}
+							}
+						}
 					}
 				}
 			})
 		);
+	}
+	
+	// Create a meaningful title for a markdown link by scraping the URL
+	async createLinkTitle(editor: Editor, linkInfo: any) {
+		try {
+			new Notice("Fetching page title...");
+			const title = await this.extractTitleFromUrl(linkInfo.originalUrl);
+			
+			if (title && title !== linkInfo.originalUrl && title !== "Link") {
+				const cursor = editor.getCursor();
+				const line = editor.getLine(cursor.line);
+				
+				// Create the new markdown link with the fetched title
+				const newLink = `[${title}](${linkInfo.originalUrl})`;
+				
+				// Replace the old link with the new one
+				const newLine = line.replace(linkInfo.fullMatch, newLink);
+				editor.setLine(cursor.line, newLine);
+				new Notice("Link title created successfully!");
+			} else {
+				new Notice("Could not fetch a meaningful title for this link.");
+			}
+		} catch (error) {
+			if (this.settings.debugMode) {
+				console.error("Error creating link title:", error);
+			}
+			new Notice("Error fetching page title. Please try again.");
+		}
 	}
 	
 	updateRibbonIcon() {
@@ -387,56 +603,446 @@ export default class LinkArchiverPlugin extends Plugin {
 	}
 
 	async extractTitleFromUrl(url: string, retryCount = 0): Promise<string> {
+		// Check cache first (if enabled and not a retry)
+		if (this.settings.enableTitleCache && retryCount === 0) {
+			const cachedTitle = this.titleCache.get(url);
+			if (cachedTitle) {
+				if (this.settings.debugMode) {
+					console.log(`Using cached title for: ${url}`);
+				}
+				return cachedTitle;
+			}
+		}
+
+// Helper function to detect YouTube URLs
+const isYouTube = (url: string) => url.includes('youtube.com/watch') || url.includes('youtu.be/');
+
+// Helper function to detect GhostArchive URLs
+const isGhostArchive = (url: string) => url.includes('ghostarchive.org/archive/') || url.includes('ghostarchive.org/varchive/');
+
+// Helper function to detect Wayback Machine URLs
+const isWaybackMachine = (url: string) => url.includes('web.archive.org');
+
 		try {
-			// Minimal headers to avoid detection
+			// Enhanced headers to avoid detection and improve success rate
 			const headers = {
-				'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-				'Accept-Language': 'en-US,en;q=0.5'
+				'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+				'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+				'Accept-Language': 'en-US,en;q=0.5',
+				'Accept-Encoding': 'gzip, deflate',
+				'Connection': 'keep-alive',
+				'Upgrade-Insecure-Requests': '1',
 			};
 
-			const response = await requestUrl({
-				url: url,
-				headers: headers
+			// Create a promise that rejects after timeout
+			const timeoutPromise = new Promise<never>((_, reject) => {
+				setTimeout(() => reject(new Error('Title fetch timeout')), this.settings.titleFetchTimeout);
 			});
-			
+
+			// Race between the fetch and the timeout
+			const response = await Promise.race([
+				requestUrl({ url: url, headers: headers }),
+				timeoutPromise
+			]);
+
 			if (response.status === 200) {
 				const $ = cheerio.load(response.text);
-				
-				// Simply get the title tag content
-				const title = $('title').text().trim();
-				
-				if (title && title !== "") {
-					return title;
+				let title = '';
+
+    // For GhostArchive URLs, extract the archived page's title
+    if (isGhostArchive(url)) {
+      // GhostArchive-specific title cleaning
+      const cleanGhostTitle = (title: string): string => {
+        return title
+          .replace(/ - GhostArchive$/, '')
+          .replace(/ \| GhostArchive$/, '')
+          .replace(/GhostArchive - /, '')
+          .replace(/^GhostArchive:\s*/i, '')
+          .trim();
+      };
+
+      // Apply cleaning to all title sources
+      title = cleanGhostTitle(title);
+					// GhostArchive pages contain the original title
+					// Try og:title first (most reliable for archived content)
+					title = $('meta[property="og:title"]').attr('content')?.trim() || '';
+
+					// Try meta name="title"
+					if (!title) {
+						title = $('meta[name="title"]').attr('content')?.trim() || '';
+					}
+
+					// Try to find title in the page content - look for common selectors
+					if (!title) {
+						title = $('h1').first().text().trim() ||
+								$('.video-title').first().text().trim() ||
+								$('.page-title').first().text().trim() ||
+								$('.title').first().text().trim() ||
+								$('[class*="title"]').first().text().trim();
+					}
+
+					// Fall back to <title> tag, removing "GhostArchive" suffix if present
+					if (!title) {
+						title = $('title').first().text().trim();
+						title = title.replace(/ - GhostArchive$/, '')
+									 .replace(/ \| GhostArchive$/, '')
+									 .replace(/GhostArchive - /, '')
+									 .trim();
+					}
+
+					// Additional cleanup for GhostArchive titles
+					if (title) {
+						title = title.replace(/^GhostArchive:\s*/i, '').trim();
+					}
 				}
+    // For YouTube, prioritize meta tags over <title> (which includes " - YouTube")
+    else if (isYouTube(url)) {
+					// 1. og:title meta tag (best for YouTube)
+					title = $('meta[property="og:title"]').attr('content')?.trim() || '';
+
+					// 2. twitter:title meta tag
+					if (!title) {
+						title = $('meta[name="twitter:title"]').attr('content')?.trim() || '';
+					}
+
+					// 3. name meta tag
+					if (!title) {
+						title = $('meta[name="title"]').attr('content')?.trim() || '';
+					}
+
+					// 4. <title> tag (as last resort, will have " - YouTube" suffix)
+					if (!title) {
+						title = $('title').first().text().trim();
+						// Remove " - YouTube" suffix (with or without leading content)
+						title = title.replace(/ - YouTube$/, '').replace(/^- YouTube$/, '').replace(/^YouTube$/, '');
+					}
+				} else {
+					// 1. <title> tag
+					title = $('title').first().text().trim();
+
+					// 2. og:title meta tag
+					if (!title) {
+						title = $('meta[property="og:title"]').attr('content')?.trim() || '';
+					}
+
+					// 3. twitter:title meta tag
+					if (!title) {
+						title = $('meta[name="twitter:title"]').attr('content')?.trim() || '';
+					}
+				}
+
+				// Clean up title
+				title = title.trim();
+
+    // Special handling for YouTube to avoid generic titles and bad titles
+    if (isYouTube(url)) {
+					const badTitles = [
+						'youtube.com', 'www.youtube.com', 'youtube', '- youtube', 'youtu.be', '',
+						'Enjoy the videos and music you love, upload original content, and share it all with friends, family, and the world on YouTube.',
+						'YouTube'
+					];
+					
+					const isBadTitle = badTitles.includes(title.toLowerCase()) ||
+									   title.length === 0 ||
+									   title === url;
+
+					// If we got a bad title, try GhostArchive fallback immediately
+					if (isBadTitle || retryCount === 0) {
+						console.log(`Got bad YouTube title: "${title}", trying GhostArchive fallback...`);
+						const ghostTitle = await this.extractTitleFromGhostArchive(url);
+						if (ghostTitle && ghostTitle !== url && !badTitles.includes(ghostTitle.toLowerCase()) && ghostTitle !== 'Link') {
+							title = ghostTitle;
+							console.log(`Successfully got title from GhostArchive: "${title}"`);
+						}
+					}
+				}
+
+				// Additional fallback for all URLs if no title found
+				if (!title || title === url) {
+					// 4. meta description (for all URLs)
+					title = $('meta[name="description"]').attr('content')?.trim() || '';
+					// Truncate long descriptions
+					if (title && title.length > 100) {
+						title = title.substring(0, 100) + '...';
+					}
+				}
+
+				// 5. <h1> tag
+				if (!title || title === url) {
+					title = $('h1').first().text().trim();
+				}
+
+				// 6. Domain name fallback
+				if (!title || title === url) {
+					const urlObj = new URL(url);
+					title = urlObj.hostname.replace(/^www\./, '');
+				}
+
+				// Cache the result (even fallback results)
+				if (this.settings.enableTitleCache && title) {
+					this.titleCache.set(url, title);
+				}
+
+				return title || 'Link';
 			}
-			
+
 			// If we couldn't get a title, extract domain
 			const urlObj = new URL(url);
-			return urlObj.hostname.replace(/^www\./, '');
+			const fallbackTitle = urlObj.hostname.replace(/^www\./, '');
+
+			// Cache fallback too
+			if (this.settings.enableTitleCache) {
+				this.titleCache.set(url, fallbackTitle);
+			}
+
+			return fallbackTitle;
 		} catch (error) {
 			if (this.settings.debugMode) {
 				console.error("Error extracting title:", error);
 			}
-			
-			// Implement retry logic with exponential backoff
-			if (retryCount < 2) { // Try up to 3 times total (initial + 2 retries)
+
+    // Special fallback for YouTube: try to get title from GhostArchive if it exists
+    if (isYouTube(url) && retryCount === 0) {
+				console.log("YouTube scraping failed, trying GhostArchive fallback...");
+				const ghostTitle = await this.extractTitleFromGhostArchive(url);
+				if (ghostTitle && ghostTitle !== url && ghostTitle !== 'Link') {
+					// Cache the result
+					if (this.settings.enableTitleCache) {
+						this.titleCache.set(url, ghostTitle);
+					}
+					return ghostTitle;
+				}
+			}
+
+			// Implement retry logic with exponential backoff (only for non-timeout errors)
+			const isTimeout = error.message && error.message.includes('timeout');
+			if (!isTimeout && retryCount < 2) { // Try up to 3 times total (initial + 2 retries)
 				const delay = Math.pow(2, retryCount) * 1000; // 1s, 2s delay
-				
+
 				// Wait for the delay period
 				await new Promise(resolve => setTimeout(resolve, delay));
-				
+
 				// Retry with incremented counter
 				return this.extractTitleFromUrl(url, retryCount + 1);
 			}
-			
-			// If all retries failed or we're not retrying, fall back to domain name
+
+			// If all retries failed or timeout, fall back to domain name
 			try {
 				const urlObj = new URL(url);
-				return urlObj.hostname.replace(/^www\./, '');
+				const fallbackTitle = urlObj.hostname.replace(/^www\./, '');
+
+				// Cache fallback
+				if (this.settings.enableTitleCache) {
+					this.titleCache.set(url, fallbackTitle);
+				}
+
+				return fallbackTitle;
 			} catch {
 				return "Link";
 			}
 		}
+	}
+
+	// Fallback: Extract title from GhostArchive for YouTube videos
+	private async extractTitleFromGhostArchive(youtubeUrl: string): Promise<string> {
+		try {
+			// Extract video ID
+			const youtubeMatch = youtubeUrl.match(/[?&]v=([^&]+)/) ||
+								youtubeUrl.match(/youtu\.be\/([^?&]+)/) ||
+								youtubeUrl.match(/youtube\.com\/embed\/([^?&]+)/) ||
+								youtubeUrl.match(/youtube\.com\/v\/([^?&]+)/);
+
+			if (!youtubeMatch || !youtubeMatch[1]) {
+				return youtubeUrl;
+			}
+
+			const videoId = youtubeMatch[1];
+			const ghostUrl = `https://ghostarchive.org/varchive/${videoId}`;
+
+			console.log(`Attempting to extract title from GhostArchive: ${ghostUrl}`);
+
+			const response = await requestUrl({
+				url: ghostUrl,
+				headers: {
+					'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+					'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+					'Accept-Language': 'en-US,en;q=0.5',
+					'Accept-Encoding': 'gzip, deflate',
+					'Connection': 'keep-alive',
+					'Upgrade-Insecure-Requests': '1',
+				},
+				throw: false
+			});
+
+			if (response.status === 200) {
+				const $ = cheerio.load(response.text);
+				let title = '';
+
+				console.log(`GhostArchive page loaded successfully, extracting title...`);
+
+				// Try multiple selectors specific to GhostArchive's layout
+				// 1. Meta og:title (most reliable)
+				title = $('meta[property="og:title"]').attr('content')?.trim() || '';
+				if (title) console.log(`Found title in og:title: "${title}"`);
+
+				// 2. Page title (remove GhostArchive suffix)
+				if (!title) {
+					const rawTitle = $('title').first().text().trim();
+					console.log(`Found raw title tag: "${rawTitle}"`);
+					// Extract the actual video title from GhostArchive page title
+					// Format is usually: "[Video Title] - GhostArchive"
+					const titleMatch = rawTitle.match(/^(.*?)\s*-?\s*GhostArchive$/i);
+					if (titleMatch && titleMatch[1]) {
+						title = titleMatch[1].trim();
+					} else {
+						title = rawTitle.replace(/ - GhostArchive$/, '')
+									 .replace(/ \| GhostArchive$/, '')
+									 .replace(/GhostArchive - /, '')
+									 .replace(/^GhostArchive:\s*/i, '')
+									 .trim();
+					}
+					if (title && title !== rawTitle) console.log(`Cleaned title: "${title}"`);
+				}
+
+				// 3. Meta name="title"
+				if (!title) {
+					title = $('meta[name="title"]').attr('content')?.trim() || '';
+					if (title) console.log(`Found title in meta name="title": "${title}"`);
+				}
+
+				// 4. Meta twitter:title
+				if (!title) {
+					title = $('meta[name="twitter:title"]').attr('content')?.trim() || '';
+					if (title) console.log(`Found title in twitter:title: "${title}"`);
+				}
+
+				// 5. Look for h1 or main heading
+				if (!title) {
+					title = $('h1').first().text().trim();
+					if (title) console.log(`Found title in h1: "${title}"`);
+				}
+
+				// 6. Look for common video title classes
+				if (!title) {
+					const classSelectors = ['.video-title', '.page-title', '.title', '[class*="title"]', '[class*="video"]'];
+					for (const selector of classSelectors) {
+						title = $(selector).first().text().trim();
+						if (title) {
+							console.log(`Found title in ${selector}: "${title}"`);
+							break;
+						}
+					}
+				}
+
+				// 7. Look for iframe and nearby elements
+				if (!title) {
+					const iframe = $('iframe[src*="youtube.com"]');
+					if (iframe.length) {
+						console.log(`Found YouTube iframe, looking for nearby title...`);
+						// Check iframe's parent and siblings
+						title = iframe.parent().find('h1, h2, h3, .title').first().text().trim() ||
+								iframe.siblings('h1, h2, h3, .title').first().text().trim() ||
+								iframe.closest('div').find('h1, h2, h3, .title').first().text().trim();
+						if (title) console.log(`Found title near iframe: "${title}"`);
+					}
+				}
+
+				// Clean up any GhostArchive branding that slipped through
+				if (title) {
+					title = title.replace(/\s*[-|]\s*GhostArchive\s*$/i, '').trim();
+				}
+
+				if (title && title !== 'Enjoy the videos and music you love, upload original content, and share it all with friends, family, and the world on YouTube.') {
+					console.log(`Successfully extracted title from GhostArchive: "${title}"`);
+					return title;
+				} else {
+					console.log(`No valid title found on GhostArchive page`);
+					// Log first 500 chars of page to help debug
+					if (this.settings.debugMode) {
+						console.log(`First 500 chars of page:`, response.text.substring(0, 500));
+					}
+				}
+			} else if (response.status === 404) {
+				console.log(`GhostArchive URL not found: ${ghostUrl}`);
+			} else {
+				console.log(`GhostArchive returned status ${response.status}`);
+			}
+		} catch (error) {
+			console.log(`Error extracting title from GhostArchive: ${error}`);
+		}
+
+		// If GhostArchive fails, try to get title directly from YouTube
+		try {
+			console.log(`Attempting to extract title directly from YouTube: ${youtubeUrl}`);
+			
+			const response = await requestUrl({
+				url: youtubeUrl,
+				headers: {
+					'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+					'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+					'Accept-Language': 'en-US,en;q=0.5',
+					'Accept-Encoding': 'gzip, deflate',
+					'Connection': 'keep-alive',
+					'Upgrade-Insecure-Requests': '1',
+				},
+				throw: false
+			});
+
+			if (response.status === 200) {
+				const $ = cheerio.load(response.text);
+				let title = '';
+
+				console.log(`YouTube page loaded successfully, extracting title...`);
+
+				// Try multiple selectors for YouTube
+				// 1. Meta og:title (most reliable for YouTube)
+				title = $('meta[property="og:title"]').attr('content')?.trim() || '';
+				if (title) console.log(`Found title in YouTube og:title: "${title}"`);
+
+				// 2. Page title (remove YouTube suffix)
+				if (!title) {
+					const rawTitle = $('title').first().text().trim();
+					console.log(`Found raw YouTube title tag: "${rawTitle}"`);
+					// Extract the actual video title from YouTube page title
+					// Format is usually: "[Video Title] - YouTube"
+					const titleMatch = rawTitle.match(/^(.*?)\s*-?\s*YouTube$/i);
+					if (titleMatch && titleMatch[1]) {
+						title = titleMatch[1].trim();
+					} else {
+						title = rawTitle.replace(/ - YouTube$/, '')
+									 .replace(/^- YouTube$/, '')
+									 .replace(/^YouTube$/, '')
+									 .trim();
+					}
+					if (title && title !== rawTitle) console.log(`Cleaned YouTube title: "${title}"`);
+				}
+
+				// 3. Meta name="title"
+				if (!title) {
+					title = $('meta[name="title"]').attr('content')?.trim() || '';
+					if (title) console.log(`Found title in YouTube meta name="title": "${title}"`);
+				}
+
+				// 4. Look for h1 with specific YouTube classes
+				if (!title) {
+					title = $('h1.ytd-video-primary-info-renderer').first().text().trim() ||
+							$('h1.title').first().text().trim() ||
+							$('h1').first().text().trim();
+					if (title) console.log(`Found title in YouTube h1: "${title}"`);
+				}
+
+				if (title && title !== 'Enjoy the videos and music you love, upload original content, and share it all with friends, family, and the world on YouTube.') {
+					console.log(`Successfully extracted title from YouTube: "${title}"`);
+					return title;
+				} else {
+					console.log(`No valid title found on YouTube page`);
+				}
+			}
+		} catch (error) {
+			console.log(`Error extracting title directly from YouTube: ${error}`);
+		}
+
+		return youtubeUrl;
 	}
 
 	async replaceLinkInLine(editor: Editor, lineNumber: number, originalLine: string, linkInfo: any, archivedUrl: string) {
@@ -737,6 +1343,144 @@ export default class LinkArchiverPlugin extends Plugin {
     skippedDetails
   };
 }
+
+	// Convert naked URLs to markdown links at cursor position or in selection
+	async convertNakedUrlsToMarkdown(editor: Editor) {
+		if (!this.settings.scrapePageTitles) {
+			new Notice("Please enable 'Scrape page titles' in settings to use this feature.");
+			return;
+		}
+
+		const cursor = editor.getCursor();
+		const selection = editor.getSelection();
+
+		// Check if user has selected text
+		if (selection) {
+			await this.convertUrlsInText(editor, selection, cursor.line, true);
+		} else {
+			// Work on current line
+			const line = editor.getLine(cursor.line);
+			await this.convertUrlsInText(editor, line, cursor.line, false);
+		}
+	}
+
+	// Helper method to convert URLs in a given text
+	async convertUrlsInText(editor: Editor, text: string, lineNumber: number, isSelection: boolean = false) {
+		// Find all naked URLs (not already in markdown links)
+		const urlRegex = /(?<!\]\()https?:\/\/[^\s)\]]+(?!\))/g;
+		const urls = text.match(urlRegex);
+
+		if (!urls || urls.length === 0) {
+			new Notice("No naked URLs found to convert.");
+			return;
+		}
+
+		// Skip URLs in code blocks (only check if not a selection)
+		if (!isSelection) {
+			const line = editor.getLine(lineNumber);
+			if (this.isCodeBlockOrQuote(editor.getValue().split('\n'), lineNumber)) {
+				new Notice("Cannot convert URLs inside code blocks or quotes.");
+				return;
+			}
+		}
+
+		new Notice(`Converting ${urls.length} naked URL${urls.length > 1 ? 's' : ''}...`);
+
+		let modifiedText = text;
+		let successCount = 0;
+
+		// Process URLs one by one
+		for (const url of urls) {
+			try {
+				const title = await this.extractTitleFromUrl(url);
+
+				// Replace the naked URL with markdown link
+				modifiedText = modifiedText.replace(url, `[${title}](${url})`);
+				successCount++;
+
+				// Show progress for multiple URLs
+				if (urls.length > 1) {
+					new Notice(`Converted ${successCount}/${urls.length} URLs...`);
+				}
+
+				// Add delay between requests if multiple URLs
+				if (urls.indexOf(url) < urls.length - 1) {
+					await new Promise(resolve => setTimeout(resolve, 500));
+				}
+			} catch (error) {
+				if (this.settings.debugMode) {
+					console.error(`Error converting URL ${url}:`, error);
+				}
+			}
+		}
+
+		// Replace the text - either selection or entire line
+		if (isSelection) {
+			editor.replaceSelection(modifiedText);
+		} else {
+			editor.setLine(lineNumber, modifiedText);
+		}
+
+		new Notice(`Successfully converted ${successCount} URL${successCount > 1 ? 's' : ''} to markdown.`);
+	}
+
+	// Convert all naked URLs in the entire note
+	async convertAllNakedUrlsInNote(editor: Editor) {
+		if (!this.settings.scrapePageTitles) {
+			new Notice("Please enable 'Scrape page titles' in settings to use this feature.");
+			return;
+		}
+
+		const content = editor.getValue();
+		const lines = content.split('\n');
+		let totalConverted = 0;
+
+		new Notice("Converting all naked URLs in note...");
+
+		// Process line by line
+		for (let i = 0; i < lines.length; i++) {
+			// Skip code blocks and quotes
+			if (this.isCodeBlockOrQuote(lines, i)) {
+				continue;
+			}
+
+			const line = lines[i];
+
+			// Find naked URLs (not already in markdown links)
+			const urlRegex = /(?<!\]\()https?:\/\/[^\s)\]]+(?!\))/g;
+			const urls = line.match(urlRegex);
+
+			if (!urls || urls.length === 0) {
+				continue;
+			}
+
+			let modifiedLine = line;
+
+			// Process each URL in the line
+			for (const url of urls) {
+				try {
+					const title = await this.extractTitleFromUrl(url);
+
+					// Replace naked URL with markdown link
+					modifiedLine = modifiedLine.replace(url, `[${title}](${url})`);
+					totalConverted++;
+
+					// Add delay between requests
+					await new Promise(resolve => setTimeout(resolve, 500));
+				} catch (error) {
+					if (this.settings.debugMode) {
+						console.error(`Error converting URL ${url} on line ${i + 1}:`, error);
+					}
+				}
+			}
+
+			// Update the line
+			editor.setLine(i, modifiedLine);
+			lines[i] = modifiedLine; // Keep local array in sync
+		}
+
+		new Notice(`Conversion complete. Converted ${totalConverted} naked URL${totalConverted !== 1 ? 's' : ''} to markdown.`);
+	}
 
 	async archiveAllLinksInCurrentNote() {
   const leaf = this.app.workspace.getMostRecentLeaf();
@@ -1057,65 +1801,113 @@ export default class LinkArchiverPlugin extends Plugin {
 	async getExistingArchive(originalUrl: string, retryCount = 0): Promise<{
   foundArchive: boolean;
   archivedUrl?: string;
-  snapshots?: { url: string, timestamp: string }[];
+  snapshots?: { url: string, timestamp: string, title?: string }[];
   rateLimited?: boolean;
 }> {
   console.log(`Checking for existing archives of: ${originalUrl}`);
-  
+
+  // Check cache first (only on first try, not retries)
+  if (retryCount === 0) {
+    const cachedResult = this.archiveCache.get(originalUrl);
+    if (cachedResult) {
+      console.log(`Using cached result for: ${originalUrl}`);
+      return cachedResult;
+    }
+  }
+
+  // Enforce rate limiting
+  await this.rateLimiter.waitIfNeeded(this.settings.archiveSite);
+
   // Minimal headers to avoid detection
   const headers = {
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.5'
   };
-  
+
   const archiveBaseUrl = ARCHIVE_SITES[this.settings.archiveSite as keyof typeof ARCHIVE_SITES];
   console.log(`Using archive site: ${this.settings.archiveSite} (${archiveBaseUrl})`);
   console.log(`Archive service type: ${typeof this.settings.archiveSite}`);
-  
+
   if (this.settings.archiveSite === "web.archive.org") {
     console.log("Processing with Wayback Machine");
-    // Wayback Machine API
+    // Wayback Machine CDX Server API - returns multiple snapshots with filtering
     try {
-      const checkUrl = `https://archive.org/wayback/available?url=${encodeURIComponent(originalUrl)}&callback`;
-      console.log(`Checking Wayback Machine API: ${checkUrl}`);
-      
+      // Use CDX API to get multiple snapshots with status code filtering
+      // Parameters: url, output=json, limit (respects maxSnapshots), filter=statuscode:200
+      const limit = this.settings.maxSnapshots || 5;
+      const checkUrl = `https://web.archive.org/cdx/search/cdx?url=${encodeURIComponent(originalUrl)}&output=json&limit=${limit}&filter=statuscode:200`;
+      console.log(`Checking Wayback Machine CDX API: ${checkUrl}`);
+
       const res = await requestUrl({
         url: checkUrl,
         headers: headers
       });
-      if (res.status === 200 && res.json?.archived_snapshots?.closest?.available) {
-        const snapshot = res.json.archived_snapshots.closest;
-        console.log(`Found Wayback Machine snapshot: ${snapshot.url}`);
-        
-        return {
-          foundArchive: true,
-          archivedUrl: snapshot.url,
-          snapshots: [{ url: snapshot.url, timestamp: snapshot.timestamp || 'Unknown' }]
-        };
-      } else if (this.settings.debugMode) {
+
+      if (res.status === 200 && res.json && Array.isArray(res.json) && res.json.length > 1) {
+        // CDX returns array of arrays: [["urlkey", "timestamp", "original", "mimetype", "statuscode", "digest", "length"], ...]
+        // First row is headers, subsequent rows are snapshots
+        const snapshots: { url: string, timestamp: string }[] = [];
+
+        // Skip first row (headers) and process snapshot rows
+        for (let i = 1; i < res.json.length; i++) {
+          const row = res.json[i];
+          if (row && row.length >= 2) {
+            const timestamp = row[1]; // Timestamp in YYYYMMDDhhmmss format
+            const snapshotUrl = `https://web.archive.org/web/${timestamp}/${originalUrl}`;
+            snapshots.push({ url: snapshotUrl, timestamp: timestamp });
+          }
+        }
+
+        if (snapshots.length > 0) {
+          // Sort by timestamp descending (newest first)
+          snapshots.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+
+          console.log(`Found ${snapshots.length} Wayback Machine snapshots`);
+
+          const result = {
+            foundArchive: true,
+            archivedUrl: snapshots[0].url,
+            snapshots: snapshots
+          };
+
+          // Cache the result
+          this.archiveCache.set(originalUrl, result);
+
+          return result;
+        }
+      }
+
+      if (this.settings.debugMode) {
         console.log(`No Wayback Machine snapshots found`);
       }
     } catch (err) {
       console.error("Error checking Wayback Machine:", err);
-      
+
+      // Classify the error
+      const archiveError = this.classifyArchiveError(err, "Wayback Machine");
+
+      // Show user-friendly error message
+      if (archiveError.type !== ArchiveErrorType.UNKNOWN) {
+        new Notice(archiveError.message);
+      }
+
       // Check for rate limiting
-      if (err.status === 429 ||
-          (err.message && (
-            err.message.includes("rate limit") ||
-            err.message.includes("too many requests")
-          ))) {
+      if (archiveError.type === ArchiveErrorType.RATE_LIMITED) {
         console.log("Rate limited by Wayback Machine");
         return { foundArchive: false, rateLimited: true };
       }
-      
-      // Implement retry logic with exponential backoff
-      if (retryCount < 2) { // Try up to 3 times total (initial + 2 retries)
+
+      // Implement retry logic with exponential backoff for transient errors
+      if (retryCount < 2 && (
+        archiveError.type === ArchiveErrorType.NETWORK_ERROR ||
+        archiveError.type === ArchiveErrorType.SERVICE_UNAVAILABLE
+      )) {
         const delay = Math.pow(2, retryCount) * 1000; // 1s, 2s delay
         console.log(`Retrying Wayback Machine check in ${delay}ms...`);
-        
+
         // Wait for the delay period
         await new Promise(resolve => setTimeout(resolve, delay));
-        
+
         // Retry with incremented counter
         return this.getExistingArchive(originalUrl, retryCount + 1);
       }
@@ -1145,66 +1937,119 @@ export default class LinkArchiverPlugin extends Plugin {
         if (this.settings.debugMode) {
           console.log(`Found ${snapshots.length} Ghostarchive snapshots`);
         }
-        return {
+
+        const result = {
           foundArchive: true,
           archivedUrl: snapshots[0].url,
           snapshots: snapshots
         };
+
+        // Cache the result
+        this.archiveCache.set(originalUrl, result);
+
+        return result;
       } else if (this.settings.debugMode) {
         console.log(`No Ghostarchive snapshots found for URL: ${originalUrl}`);
       }
     } catch (err) {
       console.error("Error checking Ghostarchive:", err);
-      
-      if (err.status === 429 ||
-          (err.message && err.message.includes("rate limit"))) {
-        console.log("Rate limited by Ghostarchive");
-        return { foundArchive: false, rateLimited: true };
-      }
-    }
-  } else {
-    // Archive.today family sites - use HTML scraping
-    console.log("Processing with archive.today family");
-    try {
-      if (this.settings.debugMode) {
-        console.log(`Checking archive site for: ${originalUrl}`);
-      }
-      const snapshots = await this.getArchiveTodaySnapshots(originalUrl, archiveBaseUrl);
 
-      if (this.settings.debugMode) {
-        console.log(`getArchiveTodaySnapshots returned ${snapshots.length} snapshots`);
+      // Classify the error
+      const archiveError = this.classifyArchiveError(err, "GhostArchive");
+
+      // Show user-friendly error message
+      if (archiveError.type !== ArchiveErrorType.UNKNOWN) {
+        new Notice(archiveError.message);
       }
-      
-      if (snapshots.length > 0) {
-        if (this.settings.debugMode) {
-          console.log(`Found ${snapshots.length} snapshots for archive.today`);
-        }
-        return {
-          foundArchive: true,
-          archivedUrl: snapshots[0].url, // Latest snapshot (already sorted)
-          snapshots: snapshots
-        };
-      } else if (this.settings.debugMode) {
-        console.log(`No archive.today snapshots found for URL: ${originalUrl}`);
-      }
-    } catch (err) {
-      console.error("Error checking archive via HTML scrape:", err);
-      
-      // Check for rate limiting
-      if (err.status === 429 ||
-          (err.message && (
-            err.message.includes("rate limit") ||
-            err.message.includes("too many requests")
-          ))) {
-        console.log("Rate limited by archive.today");
+
+      if (archiveError.type === ArchiveErrorType.RATE_LIMITED) {
+        console.log("Rate limited by Ghostarchive");
         return { foundArchive: false, rateLimited: true };
       }
     }
   }
   
   console.log(`No archives found for: ${originalUrl}`);
-  return { foundArchive: false };
+  const result = { foundArchive: false };
+
+  // Cache negative results too to avoid repeated failed lookups
+  this.archiveCache.set(originalUrl, result);
+
+  return result;
 }
+
+	// Classify archive service errors for better user feedback
+	classifyArchiveError(err: any, serviceName: string): ArchiveError {
+		// Check for rate limiting
+		if (err.status === 429 ||
+				(err.message && (
+					err.message.toLowerCase().includes("rate limit") ||
+					err.message.toLowerCase().includes("too many requests")
+				))) {
+			return {
+				type: ArchiveErrorType.RATE_LIMITED,
+				message: `${serviceName} is rate limiting requests. Please wait a moment and try again.`,
+				serviceName
+			};
+		}
+
+		// Check for captcha requirements (common with archive.today variants)
+		if (err.status === 403 ||
+				(err.text && (
+					err.text.includes("captcha") ||
+					err.text.includes("CAPTCHA") ||
+					err.text.includes("cloudflare") ||
+					err.text.includes("challenge")
+				))) {
+			return {
+				type: ArchiveErrorType.CAPTCHA_REQUIRED,
+				message: `${serviceName} requires CAPTCHA verification. This service cannot be automated.`,
+				serviceName
+			};
+		}
+
+		// Check for IP blocking
+		if (err.status === 403 && err.message && err.message.toLowerCase().includes("forbidden")) {
+			return {
+				type: ArchiveErrorType.IP_BLOCKED,
+				message: `${serviceName} has blocked this request. Your IP may be temporarily blocked.`,
+				serviceName
+			};
+		}
+
+		// Check for service unavailability
+		if (err.status === 503 || err.status === 504 ||
+				(err.message && (
+					err.message.toLowerCase().includes("service unavailable") ||
+					err.message.toLowerCase().includes("gateway timeout")
+				))) {
+			return {
+				type: ArchiveErrorType.SERVICE_UNAVAILABLE,
+				message: `${serviceName} is currently unavailable. Please try again later.`,
+				serviceName
+			};
+		}
+
+		// Network errors
+		if (err.message && (
+				err.message.toLowerCase().includes("network") ||
+				err.message.toLowerCase().includes("timeout") ||
+				err.message.toLowerCase().includes("econnrefused")
+			)) {
+			return {
+				type: ArchiveErrorType.NETWORK_ERROR,
+				message: `Network error connecting to ${serviceName}. Check your internet connection.`,
+				serviceName
+			};
+		}
+
+		// Unknown error
+		return {
+			type: ArchiveErrorType.UNKNOWN,
+			message: `Error accessing ${serviceName}: ${err.message || 'Unknown error'}`,
+			serviceName
+		};
+	}
 
 // Normalize a URL for comparison
 	normalizeUrl(url: string): string {
@@ -1409,194 +2254,6 @@ export default class LinkArchiverPlugin extends Plugin {
   }
 }
 
-	async getArchiveTodaySnapshots(originalUrl: string, archiveBaseUrl: string, retryCount = 0): Promise<{ url: string, timestamp: string }[]> {
-		try {
-			// Minimal headers to avoid detection
-			const headers = {
-				'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-				'Accept-Language': 'en-US,en;q=0.5'
-			};
-
-			// For ghostarchive.org, use a single properly formatted search URL
-			let searchUrl;
-			if (this.settings.archiveSite === 'ghostarchive.org') {
-			  searchUrl = `https://ghostarchive.org/search?term=${encodeURIComponent(originalUrl)}`;
-			} else {
-			  // For archive.today, try multiple search approaches
-			  searchUrl = [
-					`${archiveBaseUrl}/${originalUrl}`,
-					`${archiveBaseUrl}/search/?q=${encodeURIComponent(originalUrl)}`,
-					`${archiveBaseUrl}/${encodeURIComponent(originalUrl)}`
-				];
-			}
-			
-			for (const url of searchUrl) {
-				try {
-					const res = await requestUrl({
-						url: url,
-						headers: headers
-					});
-					
-					if (res.status === 200) {
-						const $ = cheerio.load(res.text);
-						const snapshots: { url: string, timestamp: string }[] = [];
-						
-						// Look for snapshot links - they typically follow patterns like /abc123
-						$('a[href]').each((_, el) => {
-							const href = $(el).attr('href');
-							const linkText = $(el).text().trim();
-							
-							// Match snapshot-style URLs
-							if (href && /^\/[a-zA-Z0-9]{4,10}$/.test(href)) {
-								let timestamp = '';
-								
-								// Method 1: Look for timestamp div with specific styling (archive.today format)
-								const parentContainer = $(el).closest('tr, td, div, li');
-								const timestampDiv = parentContainer.find('div[style*="color:black"][style*="font-size:9px"]');
-								
-								if (timestampDiv.length > 0) {
-									timestamp = timestampDiv.text().trim();
-								} else {
-									// Method 2: Look for any div with timestamp-like content in the same container
-									parentContainer.find('div').each((_, div) => {
-										const divText = $(div).text().trim();
-										if (this.isValidTimestamp(divText)) {
-											timestamp = divText;
-											return false; // Break out of each loop
-										}
-									});
-									
-									// Method 3: Look in adjacent cells or elements
-									if (!timestamp) {
-										const adjacentElements = parentContainer.siblings();
-										adjacentElements.each((_, sibling) => {
-											const siblingText = $(sibling).text().trim();
-											if (this.isValidTimestamp(siblingText)) {
-												timestamp = siblingText;
-												return false; // Break out of each loop
-											}
-										});
-									}
-									
-									// Method 4: Look for timestamp in the same table row
-									if (!timestamp) {
-										const tableRow = $(el).closest('tr');
-										if (tableRow.length > 0) {
-											tableRow.find('td, th').each((_, cell) => {
-												const cellText = $(cell).text().trim();
-												if (this.isValidTimestamp(cellText)) {
-													timestamp = cellText;
-													return false; // Break out of each loop
-												}
-											});
-										}
-									}
-								}
-								
-								const fullUrl = `${archiveBaseUrl}${href}`;
-                								
-								// Only add if it's a valid archive URL and has a timestamp (if required)
-								if (this.isValidArchiveUrl(fullUrl) && this.isValidArchiveSnapshot(fullUrl, originalUrl)) {
-                  if (!this.settings.requireTimestamps || (timestamp && this.isValidTimestamp(timestamp))) {
-                    snapshots.push({
-                      url: fullUrl,
-                      timestamp: timestamp || 'Unknown date'
-                    });
-                  }
-                }
-							}
-						});
-            						
-						// Also look for full archive URLs but with stricter filtering
-						$('a[href*="archive"]').each((_, el) => {
-							const href = $(el).attr('href');
-							if (href && href.startsWith('http') && this.isValidArchiveUrl(href)) {
-								// Additional check: make sure this URL actually contains archive content
-								// by checking if it contains the archive domain and a snapshot identifier
-								const hasSnapshotIdentifier = /\/[a-zA-Z0-9]{4,}/.test(href) || /\/web\/\d+/.test(href);
-								
-								if (hasSnapshotIdentifier) {
-									const linkText = $(el).text().trim();
-									const parentRow = $(el).closest('tr, li, div');
-									let timestamp = parentRow.find('.timestamp, .time, .date').first().text().trim() || '';
-									
-									// Try to extract timestamp from surrounding context
-									if (!timestamp) {
-										const parentText = parentRow.text();
-										const timestampMatch = parentText.match(/\d{1,2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}|\d{4}-\d{2}-\d{2}|\d{2}\/\d{2}\/\d{4}/);
-										if (timestampMatch) {
-											timestamp = timestampMatch[0];
-										}
-									}
-									
-									if (!this.settings.requireTimestamps || this.isValidTimestamp(timestamp)) {
-										snapshots.push({
-											url: href,
-											timestamp: timestamp || 'Unknown date'
-										});
-									}
-								}
-							}
-						});
-            						
-						// Remove duplicates and sort by timestamp if possible
-						const uniqueSnapshots = snapshots.filter((snapshot, index, self) => 
-							index === self.findIndex(s => s.url === snapshot.url)
-						);
-						
-						if (this.settings.debugMode) {
-							console.log(`Found ${uniqueSnapshots.length} valid snapshots for ${originalUrl}:`, uniqueSnapshots);
-						}
-						
-              // After collecting all snapshots:
-              if (uniqueSnapshots.length > 0) {
-                // Score snapshots by relevance
-                const scoredSnapshots = uniqueSnapshots.map(snapshot => ({
-                  snapshot,
-                  score: this.scoreSnapshotRelevance(snapshot, originalUrl)
-                }));
-                
-                // Sort by score (highest first), then by timestamp if scores are equal
-                scoredSnapshots.sort((a, b) => {
-                  if (b.score !== a.score) {
-                    return b.score - a.score;
-                  }
-                  
-                  // If scores are equal, sort by timestamp
-                  if (this.isValidTimestamp(a.snapshot.timestamp) && this.isValidTimestamp(b.snapshot.timestamp)) {
-                    return new Date(b.snapshot.timestamp).getTime() - new Date(a.snapshot.timestamp).getTime();
-                  }
-                  return 0;
-                });
-                
-                // Take only the highest scoring snapshots up to the max limit
-                return scoredSnapshots.slice(0, this.settings.maxSnapshots).map(item => item.snapshot);
-              }
-					}
-
-				} catch (urlErr) {
-					console.log(`Failed to fetch ${searchUrl}:`, urlErr);
-					continue;
-				}
-			}
-		} catch (err) {
-			console.error("Error fetching archive.today snapshots:", err);
-			
-			// Implement retry logic with exponential backoff
-			if (retryCount < 2) { // Try up to 3 times total (initial + 2 retries)
-				const delay = Math.pow(2, retryCount) * 1000; // 1s, 2s delay
-				console.log(`Retrying archive.today snapshot fetch in ${delay}ms...`);
-				
-				// Wait for the delay period
-				await new Promise(resolve => setTimeout(resolve, delay));
-				
-				// Retry with incremented counter
-				return this.getArchiveTodaySnapshots(originalUrl, archiveBaseUrl, retryCount + 1);
-			}
-		}
-		return [];
-	}
-
 	async getGhostArchiveSnapshots(originalUrl: string): Promise<{ url: string, timestamp: string }[]> {
 	  // Properly construct search URL handling all edge cases
 	  let cleanUrl = originalUrl;
@@ -1765,7 +2422,7 @@ export default class LinkArchiverPlugin extends Plugin {
 }
 
 	// Fixed snapshot modal to properly resolve the promise
-	async showSnapshotModal(snapshots: { url: string, timestamp?: string }[]): Promise<string | null> {
+	async showSnapshotModal(snapshots: { url: string, timestamp?: string, title?: string }[]): Promise<string | null> {
   return new Promise((resolve) => {
     new ArchivePickerModal(this.app, this, snapshots, "", resolve).open();
   });
@@ -2147,19 +2804,20 @@ class ArchivePromptModal extends Modal {
 			.setCta()
 			.onClick(() => {
 				// Get the correct archive creation URL based on selected site
-				const archiveBaseUrl = ARCHIVE_SITES[this.plugin.settings.archiveSite as keyof typeof ARCHIVE_SITES];
 				let archiveCreateUrl: string;
-				
+
 				if (this.plugin.settings.archiveSite === "web.archive.org") {
 					archiveCreateUrl = `https://web.archive.org/save/${this.originalUrl}`;
+				} else if (this.plugin.settings.archiveSite === "ghostarchive.org") {
+					archiveCreateUrl = `https://ghostarchive.org/archive/${encodeURIComponent(this.originalUrl)}`;
 				} else {
-					// Archive.today family sites
-					archiveCreateUrl = `${archiveBaseUrl}/?run=1&url=${encodeURIComponent(this.originalUrl)}`;
+					// Fallback to Wayback Machine
+					archiveCreateUrl = `https://web.archive.org/save/${this.originalUrl}`;
 				}
-				
+
 				// Open the archive creation URL in browser
 				window.open(archiveCreateUrl, '_blank');
-				
+
 				// Show input for the user to paste the archived URL
 				this.showArchiveInputStep();
 			});
@@ -2179,7 +2837,7 @@ class ArchivePromptModal extends Modal {
 		contentEl.createEl("h2", { text: "Enter archived URL" });
 		contentEl.createEl("p", { text: "After the snapshot is created, paste the archived URL here:" });
 
-		const inputEl = contentEl.createEl("input", { type: "text", placeholder: "https://archive.ph/abc123 or https://web.archive.org/web/..." });
+		const inputEl = contentEl.createEl("input", { type: "text", placeholder: "https://web.archive.org/web/... or https://ghostarchive.org/..." });
 		inputEl.style.width = "100%";
 		inputEl.style.marginBottom = "1rem";
 
@@ -2216,12 +2874,12 @@ class ArchivePromptModal extends Modal {
 
 class ArchivePickerModal extends Modal {
 	plugin: LinkArchiverPlugin;
-	snapshots: { url: string; timestamp?: string }[];
+	snapshots: { url: string; timestamp?: string; title?: string }[];
 	originalUrl: string;
 	onSubmit: (chosenUrl: string | null) => void;
 	selectedUrl: string | null = null;
 
-	constructor(app: App, plugin: LinkArchiverPlugin, snapshots: { url: string; timestamp?: string }[], originalUrl: string, onSubmit: (chosenUrl: string | null) => void) {
+	constructor(app: App, plugin: LinkArchiverPlugin, snapshots: { url: string; timestamp?: string; title?: string }[], originalUrl: string, onSubmit: (chosenUrl: string | null) => void) {
 		super(app);
 		this.plugin = plugin;
 		this.snapshots = snapshots;
@@ -2239,7 +2897,10 @@ class ArchivePickerModal extends Modal {
 
 		this.snapshots.forEach((snapshot) => {
 			const linkEl = listContainer.createEl("div", { cls: "archive-picker-item" });
-			linkEl.textContent = snapshot.timestamp ? `${snapshot.timestamp} — ${snapshot.url}` : snapshot.url;
+			
+			// Display title if available, otherwise fallback to URL
+			const displayText = snapshot.title || (snapshot.timestamp ? `${snapshot.timestamp} — ${snapshot.url}` : snapshot.url);
+			linkEl.textContent = displayText;
 
 			linkEl.style.cursor = "pointer";
 			linkEl.style.padding = "0.5em";
@@ -2733,34 +3394,40 @@ generateReportText(): string {
 class GhostArchiveArchiver {
 	constructor(private plugin: LinkArchiverPlugin) {}
 
-	async getSnapshots(originalUrl: string): Promise<{ url: string, timestamp: string }[]> {
-		// For YouTube links, keep full URL with protocol for searches
-		let searchTerm = originalUrl;
-		if (originalUrl.includes('youtube.com') || originalUrl.includes('youtu.be')) {
-			// Keep full URL for YouTube searches
-			searchTerm = originalUrl;
-			console.log(`GhostArchiveArchiver: using full YouTube URL for search`);
-		} else {
-			// For non-YouTube URLs, remove protocol and trailing slashes
-			searchTerm = originalUrl.replace(/^https?:\/\//, '');
-			if (searchTerm.endsWith('/')) {
-				searchTerm = searchTerm.slice(0, -1);
-			}
-		}
-		
-		const searchUrl = `https://ghostarchive.org/search?term=${encodeURIComponent(searchTerm)}`;
-		console.log(`GhostArchiveArchiver: constructed search URL: ${searchUrl}`);
-
-		// Extract video ID from YouTube URLs for archive reconstruction
+	async getSnapshots(originalUrl: string): Promise<{ url: string, timestamp: string, title?: string }[]> {
+		// Extract video ID from YouTube URLs first
 		let videoId: string | null = null;
-		if (originalUrl.includes('youtube.com') || originalUrl.includes('youtu.be')) {
-			const youtubeMatch = originalUrl.match(/youtube\.com\/watch\?v=([^&]+)/) ||
-								originalUrl.match(/youtu\.be\/([^?]+)/);
+		const isYouTube = originalUrl.includes('youtube.com') || originalUrl.includes('youtu.be');
+
+		if (isYouTube) {
+			const youtubeMatch = originalUrl.match(/[?&]v=([^&]+)/) ||
+								originalUrl.match(/youtu\.be\/([^?&]+)/) ||
+								originalUrl.match(/youtube\.com\/embed\/([^?&]+)/) ||
+								originalUrl.match(/youtube\.com\/v\/([^?&]+)/);
 			if (youtubeMatch && youtubeMatch[1]) {
 				videoId = youtubeMatch[1];
 				console.log(`GhostArchiveArchiver: extracted YouTube video ID: ${videoId}`);
+
+				// For YouTube, try direct URL construction first (avoids search page blocking)
+				const directResult = await this.getYouTubeArchiveDirect(videoId);
+				if (directResult.length > 0) {
+					return directResult;
+				}
+				console.log(`GhostArchiveArchiver: direct URL check failed, trying search fallback`);
+			} else {
+				console.log(`GhostArchiveArchiver: could not extract video ID from YouTube URL`);
+				return [];
 			}
 		}
+
+		// For non-YouTube URLs or YouTube fallback, use search approach
+		let searchTerm = isYouTube && videoId ? videoId : originalUrl.replace(/^https?:\/\//, '');
+		if (searchTerm.endsWith('/')) {
+			searchTerm = searchTerm.slice(0, -1);
+		}
+
+		const searchUrl = `https://ghostarchive.org/search?term=${encodeURIComponent(searchTerm)}`;
+		console.log(`GhostArchiveArchiver: constructed search URL: ${searchUrl}`);
 		
 		try {
 			const headers = {
@@ -2787,84 +3454,72 @@ class GhostArchiveArchiver {
 			console.log(`GhostArchiveArchiver: HTTP response status ${response.status}`);
 			
 			const $ = cheerio.load(response.text);
-			const snapshots: { url: string, timestamp: string }[] = [];
+			const snapshots: { url: string, timestamp: string, title?: string }[] = [];
 			
-			// Find all archive links with case-insensitive matching
-			const links = $('a[href*="/archive/"], a[href*="/varchive/"]');
-			console.log(`GhostArchiveArchiver: found ${links.length} archive links`);
+			// Find all result rows in the search results table
+			const rows = $('.result-row');
+			console.log(`GhostArchiveArchiver: found ${rows.length} result rows`);
 			
-			// Log all links if none found
-			if (links.length === 0) {
-				console.log("GhostArchiveArchiver: No archive links found. Full HTML structure:");
-				console.log($.html());
-			} else {
-				links.each((i, el) => {
-					const href = $(el).attr('href') || '';
-					console.log(`GhostArchiveArchiver: Link ${i+1}: ${href}`);
-				});
-			}
-			
-			
-			links.each((_, link) => {
-				const $link = $(link);
+			rows.each((_, row) => {
+				const $row = $(row);
+				const $urlCell = $row.find('td:first-child');
+				const $timestampCell = $row.find('td:nth-child(2)');
+				
+				// Extract URL from the first cell
+				const $link = $urlCell.find('a');
 				let href = $link.attr('href') || '';
-				console.log(`GhostArchiveArchiver: processing archive link: ${href}`);
+				const linkText = $link.text().trim();
+				console.log(`GhostArchiveArchiver: processing result row with href: ${href}, linkText: ${linkText}`);
 				
 				// Skip if href is empty
 				if (!href) {
-					console.log(`GhostArchiveArchiver: skipping link with empty href`);
+					console.log(`GhostArchiveArchiver: skipping row with empty href`);
 					return;
 				}
 				
-				// Extract timestamp from the next table cell
-				const $timestampTd = $link.closest('td').next('td');
-				if (!$timestampTd.length) {
-					console.log(`GhostArchiveArchiver: cannot find timestamp cell`);
-					return;
-				}
-				
-				let timestamp = $timestampTd.text().trim();
-				// Clean up any extra whitespace or HTML entities
-				timestamp = timestamp.replace(/\s+/g, ' ').replace(/&nbsp;/g, ' ');
+				// Extract timestamp from the second cell
+				let timestamp = $timestampCell.text().trim();
 				console.log(`GhostArchiveArchiver: extracted timestamp: ${timestamp}`);
 				
-				// Skip validation for now - just require non-empty
+				// Clean up any extra whitespace or HTML entities
+				timestamp = timestamp.replace(/\s+/g, ' ').replace(/&nbsp;/g, ' ');
+				console.log(`GhostArchiveArchiver: cleaned timestamp: ${timestamp}`);
+				
+				// If no timestamp found, use a default
 				if (!timestamp) {
-					console.log(`GhostArchiveArchiver: empty timestamp`);
-					return;
+					timestamp = 'Unknown date';
+					console.log(`GhostArchiveArchiver: no timestamp found, using default`);
 				}
 				
-				// For YouTube links, look for video ID in href
+				// Normalize the href to a full URL
+				let fullUrl = href;
+				
+				// If href is relative, make it absolute
+				if (href.startsWith('/')) {
+					fullUrl = `https://ghostarchive.org${href}`;
+				} else if (!href.startsWith('http')) {
+					// If it's just an ID, construct the full URL
+					const isVideo = href.includes('/varchive/') || (videoId && href === videoId);
+					const baseUrl = isVideo ? 'https://ghostarchive.org/varchive/' : 'https://ghostarchive.org/archive/';
+					fullUrl = `${baseUrl}${href.replace(/^\/*(archive|varchive)\//, '')}`;
+				}
+				
+				// For YouTube videos, verify the URL contains the video ID
 				if (videoId) {
-					// Check if href contains the video ID
-					if (href.includes(videoId)) {
-						const baseUrl = href.includes('/varchive/')
-							? 'https://ghostarchive.org/varchive/'
-							: 'https://ghostarchive.org/archive/';
-						href = `${baseUrl}${videoId}`;
-					} else {
-						// If video ID not found, try matching the last part of href
-						const hrefId = href.split('/').pop();
-						if (hrefId && hrefId === videoId) {
-							const baseUrl = href.includes('/varchive/')
-								? 'https://ghostarchive.org/varchive/'
-								: 'https://ghostarchive.org/archive/';
-							href = `${baseUrl}${videoId}`;
-						}
+					if (!fullUrl.includes(videoId)) {
+						console.log(`GhostArchiveArchiver: skipping link that doesn't match video ID ${videoId}: ${fullUrl}`);
+						return;
 					}
 				}
-				// For non-YouTube links
-				else {
-					const baseUrl = href.toLowerCase().includes('/varchive/')
-						? 'https://ghostarchive.org/varchive/'
-						: 'https://ghostarchive.org/archive/';
-					href = `${baseUrl}${href.split('/').pop()}`;
+				
+				// Extract title from link text or URL
+				let title: string | undefined;
+				if (linkText && !linkText.startsWith('http') && linkText.length > 0) {
+					title = linkText;
 				}
 				
-				const url = href;
-				
-				console.log(`GhostArchiveArchiver: found valid snapshot at ${url} with timestamp ${timestamp}`);
-				snapshots.push({ url, timestamp });
+				console.log(`GhostArchiveArchiver: found valid snapshot at ${fullUrl} with timestamp ${timestamp}${title ? `, title: ${title}` : ''}`);
+				snapshots.push({ url: fullUrl, timestamp, title });
 			});
 			
 			return snapshots;
@@ -2878,6 +3533,85 @@ class GhostArchiveArchiver {
 		// Ghostarchive timestamps look like: "Mon, 02 Jun 2025 03:11:50 GMT"
 		// We'll validate by checking for a date string with at least 3 parts
 		return timestamp.trim().split(/\s+/).length >= 3;
+	}
+
+	// Direct URL construction for YouTube videos (bypasses search page blocking)
+	private async getYouTubeArchiveDirect(videoId: string): Promise<{ url: string, timestamp: string }[]> {
+		console.log(`GhostArchiveArchiver: attempting direct URL construction for video ID: ${videoId}`);
+
+		// GhostArchive uses /varchive/ for YouTube videos
+		const archiveUrl = `https://ghostarchive.org/varchive/${videoId}`;
+
+		try {
+			// Try to access the archive URL directly to verify it exists
+			const response = await requestUrl({
+				url: archiveUrl,
+				headers: {
+					'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+					'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+				},
+				method: 'GET',
+				throw: false
+			});
+
+			console.log(`GhostArchiveArchiver: direct URL check returned status ${response.status}`);
+
+			// If we get a 200, the archive exists
+			if (response.status === 200) {
+				// Try to extract timestamp from the page
+				let timestamp = 'Unknown date';
+
+				try {
+					const $ = cheerio.load(response.text);
+
+					// Look for timestamp in common locations
+					const timestampSelectors = [
+						'.archive-timestamp',
+						'.timestamp',
+						'.date',
+						'time[datetime]',
+						'meta[property="article:published_time"]'
+					];
+
+					for (const selector of timestampSelectors) {
+						const element = $(selector).first();
+						if (element.length) {
+							timestamp = element.attr('datetime') || element.text().trim();
+							if (timestamp) break;
+						}
+					}
+
+					// If still no timestamp, look for date-like text
+					if (timestamp === 'Unknown date') {
+						const pageText = $('body').text();
+						const dateMatch = pageText.match(/\w{3},\s+\d{2}\s+\w{3}\s+\d{4}\s+\d{2}:\d{2}:\d{2}\s+GMT/) ||
+										 pageText.match(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+						if (dateMatch) {
+							timestamp = dateMatch[0];
+						}
+					}
+				} catch (parseError) {
+					console.log(`GhostArchiveArchiver: could not extract timestamp: ${parseError}`);
+				}
+
+				console.log(`GhostArchiveArchiver: direct URL verified, archive exists at ${archiveUrl}`);
+				return [{ url: archiveUrl, timestamp }];
+			}
+
+			// 404 means no archive exists
+			if (response.status === 404) {
+				console.log(`GhostArchiveArchiver: no archive found at ${archiveUrl} (404)`);
+				return [];
+			}
+
+			// Other status codes (503, 403, etc.) might indicate blocking or temporary issues
+			console.log(`GhostArchiveArchiver: unexpected status ${response.status}, archive may or may not exist`);
+			return [];
+
+		} catch (error) {
+			console.error(`GhostArchiveArchiver: error checking direct URL: ${error}`);
+			return [];
+		}
 	}
 
 	async extractTitle(archivedUrl: string): Promise<string> {
@@ -2953,12 +3687,11 @@ display(): void {
   // Archive site selection
   new Setting(generalContent)
     .setName("Archive site")
-    .setDesc("Choose which archive service to use.")
+    .setDesc("Choose which archive service to use. Note: archive.today variants have been removed due to CAPTCHA requirements. GhostArchive may also require CAPTCHA verification. Wayback Machine (web.archive.org) is recommended.")
     .addDropdown((dropdown) => {
       Object.keys(ARCHIVE_SITES).forEach(site => {
         dropdown.addOption(site, site);
       });
-      // Add ghostarchive.org explicitly since it's now in ARCHIVE_SITES
       dropdown.setValue(this.plugin.settings.archiveSite)
         .onChange(async (value) => {
           this.plugin.settings.archiveSite = value;
@@ -3140,7 +3873,53 @@ if (!this.plugin.settings.autoPickLatestArchive) {
           await this.plugin.saveSettings();
         })
       );
-      
+
+    // Title scraping settings
+    generalContent.createEl("h5", { text: "Title Scraping Settings" });
+
+    new Setting(generalContent)
+      .setName("Scrape page titles")
+      .setDesc("Automatically fetch and use page titles when converting naked URLs to markdown links.")
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.scrapePageTitles).onChange(async (value) => {
+          this.plugin.settings.scrapePageTitles = value;
+          await this.plugin.saveSettings();
+          this.display(); // Refresh to show/hide dependent settings
+        })
+      );
+
+    if (this.plugin.settings.scrapePageTitles) {
+      new Setting(generalContent)
+        .setName("Enable title cache")
+        .setDesc("Cache page titles for 24 hours to improve performance and reduce network requests.")
+        .setClass("setting-indent")
+        .addToggle((toggle) =>
+          toggle.setValue(this.plugin.settings.enableTitleCache).onChange(async (value) => {
+            this.plugin.settings.enableTitleCache = value;
+            await this.plugin.saveSettings();
+          })
+        );
+
+      new Setting(generalContent)
+        .setName("Title fetch timeout")
+        .setDesc("Maximum time (in seconds) to wait when fetching page titles. Default: 10 seconds.")
+        .setClass("setting-indent")
+        .addText((text) =>
+          text
+            .setValue((this.plugin.settings.titleFetchTimeout / 1000).toString())
+            .onChange(async (value) => {
+              const numValue = parseFloat(value);
+              if (!isNaN(numValue) && numValue >= 1 && numValue <= 60) {
+                this.plugin.settings.titleFetchTimeout = numValue * 1000; // Convert to milliseconds
+                await this.plugin.saveSettings();
+              } else {
+                new Notice("Please enter a number between 1 and 60 seconds");
+                text.setValue((this.plugin.settings.titleFetchTimeout / 1000).toString());
+              }
+            })
+        );
+    }
+
     // Exclusion Settings Tab Content
     exclusionContent.createEl("h3", { text: "Exclusion Rules" });
     

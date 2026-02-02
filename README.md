@@ -22,9 +22,19 @@ Customize the divider:
 You may also remove an archive link in the context menu.
 
 ### 📜 Available services
-- archive.today/archive.is -- default is archive.ph
 - web.archive.org -- uses archive.org API to scrape a link from a .json.
-- ghostarchive.org -- good for YouTube links
+- ghostarchive.org -- good for YouTube links, general archiving
+
+### GhostArchive Title Cleaning
+GhostArchive titles are automatically cleaned using these patterns:
+- Removes trailing " - GhostArchive" or " | GhostArchive"
+- Removes leading "GhostArchive - " prefix
+- Removes "GhostArchive:" prefix
+
+Example transformations:
+- `My Article - GhostArchive` → `My Article`
+- `GhostArchive - Breaking News` → `Breaking News`
+- `GhostArchive: Research Paper` → `Research Paper`
 
 ## Additional features
 
@@ -41,8 +51,6 @@ Targeted archiving -- exclude entire folders or tags, or target specific folders
 It does not create new snapshots if they don't already exist, but will prompt the user to do so. Complete the captcha to get a link to a new snapshot. The user can opt to use an external browser or the Obsidian web browser to open the selected archive site. It's not exactly automatic, but it's a good reminder to **archive everything.**
 
 This also does not archive content locally.
-
-I wasn't able to find a plugin that did this very specific function that I wanted (create an archive link in one click from context menu) and from archive.today, so I "vibe coded" one into existence. Expect errors.
 
 ### To-do
 - Implement Wayback Machine in a better way
